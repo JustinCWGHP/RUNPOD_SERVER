@@ -1,0 +1,4 @@
+https://www.crlaurence.ca/p/ABRDA3	HTTP Error 404:
+https://www.crlaurence.ca/All-Products/Automotive-Windows-%26-Supplies/Van-Windows/Fixed/CRL-Fixed-%27All-Glass%27-Look-40%-Window---Side-Hinged-and-Sliding-Door-for-1997%2B-Chevy-GMC-Vans-17-11-16"-x-22-1-8"/p/FW131	HTTP Error 400: Bad Request
+https://www.crlaurence.ca/All-Products/Automotive-Windows-%26-Supplies/Van-Windows/Fixed/CRL-Fixed-%27All-Glass%27-Look-40%-Window-for-Side-Hinged-Door---1992%2B-Ford-Vans-15-1-4"-x-21-3-4"/p/FW231	HTTP Error 400: Bad Request
+https://www.crlaurence.ca/All-Products/Automotive-Windows-%26-Supplies/Van-Windows/Fixed/CRL-Fixed-%27All-Glass%27-Look-60%-Window---Side-Hinged-Door-1997%2B-Chevy-GMC-Vans-22-1-2"-x-22-3-8"/p/FW141	HTTP Error 400: Bad Request
