@@ -88,6 +88,12 @@ def parse_args() -> argparse.Namespace:
         help="Desired upscale factor passed to Real-ESRGAN (default matches model-scale).",
     )
     parser.add_argument(
+        "--max-outscale",
+        type=float,
+        default=16.0,
+        help="Upper bound for automatic per-image upscale adjustments; set <=0 to disable.",
+    )
+    parser.add_argument(
         "--tile",
         type=int,
         default=0,
@@ -153,6 +159,24 @@ def find_images(root: Path) -> Iterable[Path]:
             yield path
 
 
+def determine_outscale(
+    src_size: Tuple[int, int],
+    base_outscale: float,
+    canvas_size: Tuple[int, int],
+    max_outscale: float,
+) -> float:
+    """Ensure the Real-ESRGAN stage enlarges small images enough to cover the canvas."""
+    src_w, src_h = src_size
+    if src_w <= 0 or src_h <= 0:
+        raise ValueError("Source image has invalid dimensions")
+
+    required_scale = max(canvas_size[0] / src_w, canvas_size[1] / src_h)
+    outscale = max(base_outscale, required_scale)
+    if max_outscale > 0:
+        outscale = min(outscale, max_outscale)
+    return outscale
+
+
 def build_upsampler(
     model_path: Path,
     model_scale: int,
@@ -192,12 +216,16 @@ def build_upsampler(
     )
 
 
-def enhance_image(path: Path, upsampler: RealESRGANer, outscale: float) -> Image.Image:
+def enhance_image(
+    image: Image.Image,
+    name: str,
+    upsampler: RealESRGANer,
+    outscale: float,
+) -> Image.Image:
     """Enhance single image using Real-ESRGAN."""
-    print(f"  Enhancing {path.name}...")
-    with Image.open(path) as img:
-        img = img.convert("RGB")
-        np_img = np.array(img)[:, :, ::-1]  # RGB -> BGR for Real-ESRGAN
+    print(f"  Enhancing {name} (scale x{outscale:.2f})...")
+    img = image.convert("RGB")
+    np_img = np.array(img)[:, :, ::-1]  # RGB -> BGR for Real-ESRGAN
     output, _ = upsampler.enhance(np_img, outscale=outscale)
     output = output[:, :, ::-1]  # BGR -> RGB
     return Image.fromarray(output)
@@ -225,11 +253,19 @@ def process_image(
     dst_path: Path,
     upsampler: RealESRGANer,
     outscale: float,
+    max_outscale: float,
     canvas_size: Tuple[int, int],
     background: Tuple[int, int, int],
     jpeg_quality: int,
 ) -> None:
-    upscaled = enhance_image(src_path, upsampler, outscale)
+    with Image.open(src_path) as source_img:
+        dynamic_outscale = determine_outscale(
+            src_size=source_img.size,
+            base_outscale=outscale,
+            canvas_size=canvas_size,
+            max_outscale=max_outscale,
+        )
+        upscaled = enhance_image(source_img, src_path.name, upsampler, dynamic_outscale)
     final_img = fit_on_canvas(upscaled, canvas_size, background)
     final_img.save(dst_path, format="JPEG", quality=jpeg_quality, optimize=True)
 
@@ -274,6 +310,7 @@ def main() -> None:
                 dst_path=dst_path,
                 upsampler=upsampler,
                 outscale=outscale,
+                max_outscale=args.max_outscale,
                 canvas_size=canvas_size,
                 background=background,
                 jpeg_quality=args.jpeg_quality,
