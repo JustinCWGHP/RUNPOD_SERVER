@@ -34,6 +34,42 @@ def _ensure_torchvision_compat() -> None:
         module = types.ModuleType('torchvision.transforms.functional_tensor')
         module.rgb_to_grayscale = _tv_functional.rgb_to_grayscale
         sys.modules['torchvision.transforms.functional_tensor'] = module
+#!/usr/bin/env python
+"""Batch upscale images with Real-ESRGAN and export 2048x2048 JPEGs on a white canvas.
+
+Example (inside your RunPod pod):
+    python scripts/runpod_upscale.py --input-dir images --output-dir output \
+        --model-path /workspace/Real-ESRGAN/weights/RealESRGAN_x4plus.pth
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import traceback
+import types
+from pathlib import Path
+from typing import Iterable, Tuple
+
+import numpy as np
+from PIL import Image
+
+
+# Temporary shim for torchvision>=0.15 where functional_tensor moved.
+# basicsr still imports torchvision.transforms.functional_tensor, so we provide a proxy.
+def _ensure_torchvision_compat() -> None:
+    try:
+        import torchvision.transforms.functional_tensor  # type: ignore  # noqa: F401
+    except ModuleNotFoundError:
+        try:
+            from torchvision.transforms import functional as _tv_functional
+        except ImportError as exc:  # pragma: no cover - environment guard
+            raise ImportError(
+                'torchvision is required but missing; install torchvision to proceed.'
+            ) from exc
+        module = types.ModuleType('torchvision.transforms.functional_tensor')
+        module.rgb_to_grayscale = _tv_functional.rgb_to_grayscale
+        sys.modules['torchvision.transforms.functional_tensor'] = module
 
 
 _ensure_torchvision_compat()
@@ -42,9 +78,10 @@ try:
     import torch
     from realesrgan import RealESRGANer
     from basicsr.archs.rrdbnet_arch import RRDBNet
+    from gfpgan import GFPGANer
 except ImportError as exc:  # pragma: no cover - surfaced during runtime
     print(
-        "Missing Real-ESRGAN dependencies. Install with `pip install realesrgan basicsr`.",
+        "Missing Real-ESRGAN dependencies. Install with `pip install realesrgan basicsr gfpgan`.",
         file=sys.stderr,
     )
     raise
@@ -149,6 +186,11 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Call torch.cuda.empty_cache() after this many images (0 disables).",
     )
+    parser.add_argument(
+        "--face-enhance",
+        action="store_true",
+        help="Use GFPGAN to enhance faces.",
+    )
     return parser.parse_args()
 
 
@@ -220,6 +262,7 @@ def enhance_image(
     image: Image.Image,
     name: str,
     upsampler: RealESRGANer,
+    face_enhancer: GFPGANer | None,
     outscale: float,
 ) -> Image.Image:
     """Enhance single image using Real-ESRGAN."""
@@ -227,6 +270,16 @@ def enhance_image(
     img = image.convert("RGB")
     np_img = np.array(img)[:, :, ::-1]  # RGB -> BGR for Real-ESRGAN
     output, _ = upsampler.enhance(np_img, outscale=outscale)
+    
+    if face_enhancer is not None:
+        print(f"    Enhancing faces...")
+        _, _, output = face_enhancer.enhance(
+            output,
+            has_aligned=False,
+            only_center_face=False,
+            paste_back=True
+        )
+        
     output = output[:, :, ::-1]  # BGR -> RGB
     return Image.fromarray(output)
 
@@ -252,6 +305,7 @@ def process_image(
     src_path: Path,
     dst_path: Path,
     upsampler: RealESRGANer,
+    face_enhancer: GFPGANer | None,
     outscale: float,
     max_outscale: float,
     canvas_size: Tuple[int, int],
@@ -265,37 +319,9 @@ def process_image(
             canvas_size=canvas_size,
             max_outscale=max_outscale,
         )
-        upscaled = enhance_image(source_img, src_path.name, upsampler, dynamic_outscale)
+        upscaled = enhance_image(source_img, src_path.name, upsampler, face_enhancer, dynamic_outscale)
     final_img = fit_on_canvas(upscaled, canvas_size, background)
     final_img.save(dst_path, format="JPEG", quality=jpeg_quality, optimize=True)
-
-
-def main() -> None:
-    args = parse_args()
-
-    input_dir = args.input_dir.resolve()
-    output_dir = args.output_dir.resolve()
-    if not input_dir.exists():
-        raise FileNotFoundError(f"Input directory not found: {input_dir}")
-    if not args.model_path.exists():
-        raise FileNotFoundError(f"Model weights not found: {args.model_path}")
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    upsampler = build_upsampler(
-        model_path=args.model_path.resolve(),
-        model_scale=args.model_scale,
-        tile=args.tile,
-        tile_pad=args.tile_pad,
-        pre_pad=args.pre_pad,
-        use_half=args.use_half,
-    )
-
-    background = tuple(args.background)
-    canvas_size = tuple(args.canvas_size)
-    outscale = args.outscale
-
-    total = 0
     failures = 0
     for idx, src_path in enumerate(find_images(input_dir), start=1):
         rel_path = src_path.relative_to(input_dir)
@@ -309,6 +335,7 @@ def main() -> None:
                 src_path=src_path,
                 dst_path=dst_path,
                 upsampler=upsampler,
+                face_enhancer=face_enhancer,
                 outscale=outscale,
                 max_outscale=args.max_outscale,
                 canvas_size=canvas_size,
