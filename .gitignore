@@ -25,6 +25,4 @@ build/
 .DS_Store
 Thumbs.db
 
-# Output directories
-upscaled/
-output/
+
