@@ -140,9 +140,9 @@ def parse_args() -> argparse.Namespace:
         help="JPEG quality (0-100).",
     )
     parser.add_argument(
-        "--skip-existing",
+        "--overwrite",
         action="store_true",
-        help="Skip processing if the destination file already exists.",
+        help="Overwrite existing files (default: skip existing).",
     )
     parser.add_argument(
         "--clear-cache-interval",
@@ -161,14 +161,29 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Process at most N images (0 processes all). Handy for smoke tests.",
     )
+    parser.add_argument(
+        "--last",
+        type=int,
+        default=0,
+        help="Process only the last N images (sorted alphabetically).",
+    )
+    parser.add_argument(
+        "--low-vram",
+        action="store_true",
+        help="Optimize for 8GB VRAM (sets tile=512, use_half=True, clear_cache=5).",
+    )
     return parser.parse_args()
 
 
 def find_images(root: Path) -> Iterable[Path]:
     """Find all image files recursively, preserving directory structure."""
+    """Find all image files recursively, preserving directory structure."""
+    images = []
     for path in root.rglob("*"):
         if path.is_file() and path.suffix.lower() in SUPPORTED_EXTS:
-            yield path
+            images.append(path)
+    # Sort for deterministic ordering (crucial for --last)
+    return sorted(images)
 
 
 def determine_outscale(
@@ -320,6 +335,14 @@ def main() -> int:
     background = tuple(args.background)
     jpeg_quality = max(0, min(100, args.jpeg_quality))
 
+    # Apply Low VRAM overrides
+    if args.low_vram:
+        print("Low VRAM mode enabled: forcing tile=512, half=True, clear_cache=5")
+        args.tile = 512
+        args.use_half = True
+        if args.clear_cache_interval == 0:
+            args.clear_cache_interval = 5
+
     if not input_dir.exists():
         print(f"Input directory does not exist: {input_dir}", file=sys.stderr)
         return 1
@@ -342,10 +365,15 @@ def main() -> int:
     processed = 0
     failures = 0
 
-    for idx, src_path in enumerate(find_images(input_dir), start=1):
+    all_images = list(find_images(input_dir))
+    if args.last > 0:
+        all_images = all_images[-args.last:]
+        print(f"Processing only the last {len(all_images)} images.")
+
+    for idx, src_path in enumerate(all_images, start=1):
         rel_path = src_path.relative_to(input_dir)
         dst_path = (output_dir / rel_path).with_suffix(".jpg")
-        if args.skip_existing and dst_path.exists():
+        if not args.overwrite and dst_path.exists():
             print(f"[skip] {rel_path} already processed")
             continue
         if args.limit and processed >= args.limit:

@@ -24,6 +24,23 @@ The model weights are too large for GitHub. Download them separately:
 python runpod_upscale.py --input-dir SCRAPED_IMAGES --output-dir upscaled --face-enhance
 ```
 
+### 4. Advanced Options
+
+- **Process only the last N images** (useful for resuming or testing):
+  ```bash
+  python runpod_upscale.py ... --last 270
+  ```
+
+- **Optimize for 8GB VRAM** (RTX 3060/4060 laptops):
+  ```bash
+  python runpod_upscale.py ... --low-vram
+  ```
+
+- **Overwrite existing files** (default is to skip):
+  ```bash
+  python runpod_upscale.py ... --overwrite
+  ```
+
 ## GPU Support
 
 For NVIDIA GPU acceleration, install PyTorch with CUDA:
