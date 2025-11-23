@@ -252,7 +252,7 @@ def build_face_enhancer(upsampler: RealESRGANer, model_scale: int) -> GFPGANer |
             upscale=model_scale,
             arch="clean",
             channel_multiplier=2,
-            bg_upsampler=upsampler,
+            bg_upsampler=None,
             device=device,
         )
     except Exception as exc:  # pragma: no cover - runtime safety
