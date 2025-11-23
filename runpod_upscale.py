@@ -248,7 +248,7 @@ def build_face_enhancer(upsampler: RealESRGANer, model_scale: int) -> GFPGANer |
     try:
         device = upsampler.device if hasattr(upsampler, "device") else "cuda"
         return GFPGANer(
-            model_path=None,
+            model_path="https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth",
             upscale=model_scale,
             arch="clean",
             channel_multiplier=2,
