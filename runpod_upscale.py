@@ -362,6 +362,41 @@ def init_worker(
         worker_face_enhancer = build_face_enhancer(worker_upsampler, model_scale)
 
 
+def ensure_weights_exist(model_path: Path, face_enhance: bool, model_scale: int) -> None:
+    """Pre-download/verify weights in the main process to avoid race conditions."""
+    print("Verifying model weights...", flush=True)
+    
+    if not model_path.exists():
+        print(f"Warning: Real-ESRGAN model not found at {model_path}", file=sys.stderr)
+    
+    if face_enhance:
+        # Initialize GFPGANer once to trigger download
+        print("Ensuring GFPGAN weights are present...", flush=True)
+        try:
+            # We create a dummy upsampler just to satisfy the constructor if needed, 
+            # but for weight download, we just need to init the class.
+            # However, GFPGANer requires an upsampler or bg_upsampler usually.
+            # We'll just try to init it with minimal args to trigger the download logic.
+            # Actually, the safest way is to just run the build_face_enhancer logic once.
+            # We need a dummy upsampler for that.
+            
+            # Minimal dummy object to pass as upsampler
+            class DummyUpsampler:
+                device = "cpu"
+            
+            GFPGANer(
+                model_path="https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth",
+                upscale=model_scale,
+                arch="clean",
+                channel_multiplier=2,
+                bg_upsampler=DummyUpsampler(), # type: ignore
+                device="cpu",
+            )
+            print("GFPGAN weights verified.", flush=True)
+        except Exception as exc:
+            print(f"Weight verification warning: {exc}", file=sys.stderr)
+
+
 def process_image_task(
     src_path: Path,
     dst_path: Path,
@@ -437,7 +472,10 @@ def main() -> int:
         print("No images to process.")
         return 0
 
-    print(f"Processing {len(tasks)} images with {args.workers} workers...")
+    # Pre-check weights
+    ensure_weights_exist(args.model_path, args.face_enhance, args.model_scale)
+
+    print(f"Processing {len(tasks)} images with {args.workers} workers...", flush=True)
 
     # Set start method to spawn for CUDA compatibility
     try:
