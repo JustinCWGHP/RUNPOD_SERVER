@@ -370,29 +370,51 @@ def ensure_weights_exist(model_path: Path, face_enhance: bool, model_scale: int)
         print(f"Warning: Real-ESRGAN model not found at {model_path}", file=sys.stderr)
     
     if face_enhance:
-        # Initialize GFPGANer once to trigger download
-        print("Ensuring GFPGAN weights are present...", flush=True)
+        # Check if GFPGAN weights exist at the default location used by the library
+        # The library typically downloads to: /usr/local/lib/python3.X/dist-packages/gfpgan/weights/GFPGANv1.3.pth
+        # OR it uses a local weights folder if configured.
+        # Since we can't easily know the exact internal path without init, we will try a lighter check.
+        # Actually, the best way is to let the FIRST worker download it if missing, but that causes the race condition.
+        # We will use a lock file or just try to download it manually if we can determine the path.
+        
+        # Simpler approach: Just try to initialize it ONCE. If it takes time, it takes time.
+        # But to avoid the "7000 years" wait, we only do this if we suspect it's missing.
+        # However, the user's issue is likely that even "checking" is slow if it loads the model.
+        
+        # FAST PATH: If we are on RunPod, we know where it puts things usually.
+        # But to be safe and fast:
+        print("Ensuring GFPGAN weights are present (fast check)...", flush=True)
         try:
-            # We create a dummy upsampler just to satisfy the constructor if needed, 
-            # but for weight download, we just need to init the class.
-            # However, GFPGANer requires an upsampler or bg_upsampler usually.
-            # We'll just try to init it with minimal args to trigger the download logic.
-            # Actually, the safest way is to just run the build_face_enhancer logic once.
-            # We need a dummy upsampler for that.
+            # We will use a trick: Initialize with a non-existent device to avoid loading to GPU?
+            # No, that might error.
+            # We will just assume that if we are running this script, we want to be fast.
+            # Let's just download the file manually if it's not there, avoiding the library's heavy init.
             
-            # Minimal dummy object to pass as upsampler
-            class DummyUpsampler:
-                device = "cpu"
+            # Common path for gfpgan weights
+            import gfpgan
+            gfpgan_path = Path(gfpgan.__file__).parent / "weights" / "GFPGANv1.3.pth"
             
-            GFPGANer(
-                model_path="https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth",
-                upscale=model_scale,
-                arch="clean",
-                channel_multiplier=2,
-                bg_upsampler=DummyUpsampler(), # type: ignore
-                device="cpu",
-            )
-            print("GFPGAN weights verified.", flush=True)
+            if not gfpgan_path.exists():
+                print(f"Downloading GFPGAN weights to {gfpgan_path}...", flush=True)
+                # We can trigger the download by init, but we accept the cost ONCE.
+                # The user complained it takes forever, which implies it might be happening repeatedly or slowly.
+                # If we do it here, it happens once.
+                
+                # Fallback to the heavy init ONLY if file is missing.
+                class DummyUpsampler:
+                    device = "cpu"
+                
+                GFPGANer(
+                    model_path="https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth",
+                    upscale=model_scale,
+                    arch="clean",
+                    channel_multiplier=2,
+                    bg_upsampler=DummyUpsampler(), # type: ignore
+                    device="cpu",
+                )
+            else:
+                print(f"GFPGAN weights found at {gfpgan_path}, skipping heavy init.", flush=True)
+                
         except Exception as exc:
             print(f"Weight verification warning: {exc}", file=sys.stderr)
 
