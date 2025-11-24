@@ -29,35 +29,25 @@ def _ensure_torchvision_compat() -> None:
     except ModuleNotFoundError:
         try:
             from torchvision.transforms import functional as _tv_functional
-        except ImportError as exc:  # pragma: no cover - environment guard
-            raise ImportError(
-                "torchvision is required but missing; install torchvision to proceed."
-            ) from exc
+        except ImportError:
+            # If torchvision is missing, we can't do much, but we shouldn't crash at module level
+            return
         module = types.ModuleType("torchvision.transforms.functional_tensor")
         module.rgb_to_grayscale = _tv_functional.rgb_to_grayscale
         sys.modules["torchvision.transforms.functional_tensor"] = module
 
 
+# Call compat shim immediately if possible
 _ensure_torchvision_compat()
 
-try:
-    import torch
-    from realesrgan import RealESRGANer
-    from basicsr.archs.rrdbnet_arch import RRDBNet
-    from gfpgan import GFPGANer
-except ImportError as exc:  # pragma: no cover - surfaced during runtime
-    print(
-        "Missing Real-ESRGAN dependencies. Install with `pip install -r requirements.txt`.",
-        file=sys.stderr,
-    )
-    raise
+# Note: We do NOT import torch/realesrgan/gfpgan here to avoid heavy startup cost in workers.
 
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp", ".heic"}
 LANCZOS = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
 
 # Global variables for worker processes
-worker_upsampler: RealESRGANer | None = None
-worker_face_enhancer: GFPGANer | None = None
+worker_upsampler = None
+worker_face_enhancer = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -222,7 +212,12 @@ def build_upsampler(
     tile_pad: int,
     pre_pad: int,
     use_half: bool,
-) -> RealESRGANer:
+):
+    # Local import to avoid top-level overhead
+    import torch
+    from realesrgan import RealESRGANer
+    from basicsr.archs.rrdbnet_arch import RRDBNet
+
     model = RRDBNet(
         num_in_ch=3,
         num_out_ch=3,
@@ -236,10 +231,6 @@ def build_upsampler(
         print("CUDA not available; disabling half precision.", file=sys.stderr)
         use_half = False
 
-    if torch.cuda.is_available():
-        # In a worker process, we might want to be less chatty, but for now it's fine.
-        pass
-
     return RealESRGANer(
         scale=model_scale,
         model_path=str(model_path),
@@ -252,9 +243,10 @@ def build_upsampler(
     )
 
 
-def build_face_enhancer(upsampler: RealESRGANer, model_scale: int) -> GFPGANer | None:
+def build_face_enhancer(upsampler, model_scale: int):
     """Optionally load GFPGAN; fall back gracefully if weights are unavailable."""
     try:
+        from gfpgan import GFPGANer
         device = upsampler.device if hasattr(upsampler, "device") else "cuda"
         return GFPGANer(
             model_path="https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth",
@@ -272,18 +264,16 @@ def build_face_enhancer(upsampler: RealESRGANer, model_scale: int) -> GFPGANer |
 def enhance_image(
     image: Image.Image,
     name: str,
-    upsampler: RealESRGANer,
-    face_enhancer: GFPGANer | None,
+    upsampler,
+    face_enhancer,
     outscale: float,
 ) -> Image.Image:
     """Enhance single image using Real-ESRGAN and optional GFPGAN."""
-    # print(f"  Enhancing {name} (scale x{outscale:.2f})...")
     img = image.convert("RGB")
     np_img = np.array(img)[:, :, ::-1]  # RGB -> BGR for Real-ESRGAN
     output, _ = upsampler.enhance(np_img, outscale=outscale)
 
     if face_enhancer is not None:
-        # print("    Enhancing faces...")
         _, _, output = face_enhancer.enhance(
             output,
             has_aligned=False,
@@ -315,8 +305,8 @@ def fit_on_canvas(image: Image.Image, size: Tuple[int, int], background: Tuple[i
 def process_image(
     src_path: Path,
     dst_path: Path,
-    upsampler: RealESRGANer,
-    face_enhancer: GFPGANer | None,
+    upsampler,
+    face_enhancer,
     outscale: float,
     max_outscale: float,
     canvas_size: Tuple[int, int],
@@ -348,7 +338,10 @@ def init_worker(
     """Initialize models in the worker process."""
     global worker_upsampler, worker_face_enhancer
     
-    # print(f"Initializing worker {mp.current_process().name}")
+    # Ensure compatibility patches are applied in worker
+    _ensure_torchvision_compat()
+    
+    print(f"Initializing worker {mp.current_process().name}...", flush=True)
     worker_upsampler = build_upsampler(
         model_path=model_path,
         model_scale=model_scale,
@@ -370,37 +363,16 @@ def ensure_weights_exist(model_path: Path, face_enhance: bool, model_scale: int)
         print(f"Warning: Real-ESRGAN model not found at {model_path}", file=sys.stderr)
     
     if face_enhance:
-        # Check if GFPGAN weights exist at the default location used by the library
-        # The library typically downloads to: /usr/local/lib/python3.X/dist-packages/gfpgan/weights/GFPGANv1.3.pth
-        # OR it uses a local weights folder if configured.
-        # Since we can't easily know the exact internal path without init, we will try a lighter check.
-        # Actually, the best way is to let the FIRST worker download it if missing, but that causes the race condition.
-        # We will use a lock file or just try to download it manually if we can determine the path.
-        
-        # Simpler approach: Just try to initialize it ONCE. If it takes time, it takes time.
-        # But to avoid the "7000 years" wait, we only do this if we suspect it's missing.
-        # However, the user's issue is likely that even "checking" is slow if it loads the model.
-        
-        # FAST PATH: If we are on RunPod, we know where it puts things usually.
-        # But to be safe and fast:
         print("Ensuring GFPGAN weights are present (fast check)...", flush=True)
         try:
-            # We will use a trick: Initialize with a non-existent device to avoid loading to GPU?
-            # No, that might error.
-            # We will just assume that if we are running this script, we want to be fast.
-            # Let's just download the file manually if it's not there, avoiding the library's heavy init.
-            
             # Common path for gfpgan weights
             import gfpgan
             gfpgan_path = Path(gfpgan.__file__).parent / "weights" / "GFPGANv1.3.pth"
             
             if not gfpgan_path.exists():
                 print(f"Downloading GFPGAN weights to {gfpgan_path}...", flush=True)
-                # We can trigger the download by init, but we accept the cost ONCE.
-                # The user complained it takes forever, which implies it might be happening repeatedly or slowly.
-                # If we do it here, it happens once.
-                
                 # Fallback to the heavy init ONLY if file is missing.
+                from gfpgan import GFPGANer
                 class DummyUpsampler:
                     device = "cpu"
                 
@@ -536,15 +508,16 @@ def main() -> int:
                     background=background,
                     jpeg_quality=jpeg_quality,
                 )
-                print(f"[{i}/{len(tasks)}] [ok] {src_path.name}")
+                print(f"[{i}/{len(tasks)}] [ok] {src_path.name}", flush=True)
                 processed_count += 1
             except Exception as exc:
                 failures += 1
-                print(f"[{i}/{len(tasks)}] [fail] {src_path.name}: {exc}", file=sys.stderr)
-                traceback.print_exc(file=sys.stderr)
+                print(f"[{i}/{len(tasks)}] [fail] {src_path.name}: {exc}", file=sys.stderr, flush=True)
             
-            if args.clear_cache_interval and torch.cuda.is_available() and i % args.clear_cache_interval == 0:
-                torch.cuda.empty_cache()
+            if args.clear_cache_interval and i % args.clear_cache_interval == 0:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
     else:
         # Parallel execution
@@ -580,14 +553,14 @@ def main() -> int:
                 try:
                     path_str, success, error_msg = future.result()
                     if success:
-                        print(f"[{i}/{len(tasks)}] [ok] {Path(path_str).name}")
+                        print(f"[{i}/{len(tasks)}] [ok] {Path(path_str).name}", flush=True)
                         processed_count += 1
                     else:
                         failures += 1
-                        print(f"[{i}/{len(tasks)}] [fail] {Path(path_str).name}: {error_msg}", file=sys.stderr)
+                        print(f"[{i}/{len(tasks)}] [fail] {Path(path_str).name}: {error_msg}", file=sys.stderr, flush=True)
                 except Exception as exc:
                     failures += 1
-                    print(f"[{i}/{len(tasks)}] [fail] {src_path.name}: {exc}", file=sys.stderr)
+                    print(f"[{i}/{len(tasks)}] [fail] {src_path.name}: {exc}", file=sys.stderr, flush=True)
 
     print("\n=== SUMMARY ===")
     print(f"Successfully processed: {processed_count} images")
