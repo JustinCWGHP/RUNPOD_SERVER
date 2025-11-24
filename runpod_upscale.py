@@ -338,6 +338,11 @@ def init_worker(
     """Initialize models in the worker process."""
     global worker_upsampler, worker_face_enhancer
     
+    # Stagger worker start to prevent simultaneous heavy imports
+    import time
+    import random
+    time.sleep(random.uniform(0, 2))
+    
     # Limit threads to prevent CPU thrashing when running many workers
     import os
     os.environ["OMP_NUM_THREADS"] = "1"
