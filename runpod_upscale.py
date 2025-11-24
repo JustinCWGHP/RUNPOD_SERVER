@@ -338,6 +338,17 @@ def init_worker(
     """Initialize models in the worker process."""
     global worker_upsampler, worker_face_enhancer
     
+    # Limit threads to prevent CPU thrashing when running many workers
+    import os
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    
+    try:
+        import cv2
+        cv2.setNumThreads(1)
+    except ImportError:
+        pass
+    
     # Ensure compatibility patches are applied in worker
     _ensure_torchvision_compat()
     
