@@ -14,6 +14,8 @@ import traceback
 import types
 from pathlib import Path
 from typing import Iterable, Tuple
+import concurrent.futures
+import torch.multiprocessing as mp
 
 import numpy as np
 from PIL import Image
@@ -52,6 +54,10 @@ except ImportError as exc:  # pragma: no cover - surfaced during runtime
 
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp", ".heic"}
 LANCZOS = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+
+# Global variables for worker processes
+worker_upsampler: RealESRGANer | None = None
+worker_face_enhancer: GFPGANer | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -172,11 +178,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Optimize for 8GB VRAM (sets tile=512, use_half=True, clear_cache=5).",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of parallel worker processes (default: 1).",
+    )
     return parser.parse_args()
 
 
 def find_images(root: Path) -> Iterable[Path]:
-    """Find all image files recursively, preserving directory structure."""
     """Find all image files recursively, preserving directory structure."""
     images = []
     for path in root.rglob("*"):
@@ -226,10 +237,8 @@ def build_upsampler(
         use_half = False
 
     if torch.cuda.is_available():
-        print(f"Using device: {device} (GPU: {torch.cuda.get_device_name()})")
-        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-    else:
-        print(f"Using device: {device}")
+        # In a worker process, we might want to be less chatty, but for now it's fine.
+        pass
 
     return RealESRGANer(
         scale=model_scale,
@@ -268,13 +277,13 @@ def enhance_image(
     outscale: float,
 ) -> Image.Image:
     """Enhance single image using Real-ESRGAN and optional GFPGAN."""
-    print(f"  Enhancing {name} (scale x{outscale:.2f})...")
+    # print(f"  Enhancing {name} (scale x{outscale:.2f})...")
     img = image.convert("RGB")
     np_img = np.array(img)[:, :, ::-1]  # RGB -> BGR for Real-ESRGAN
     output, _ = upsampler.enhance(np_img, outscale=outscale)
 
     if face_enhancer is not None:
-        print("    Enhancing faces...")
+        # print("    Enhancing faces...")
         _, _, output = face_enhancer.enhance(
             output,
             has_aligned=False,
@@ -327,6 +336,64 @@ def process_image(
     final_img.save(dst_path, format="JPEG", quality=jpeg_quality, optimize=True)
 
 
+def init_worker(
+    model_path: Path,
+    model_scale: int,
+    tile: int,
+    tile_pad: int,
+    pre_pad: int,
+    use_half: bool,
+    use_face_enhance: bool,
+) -> None:
+    """Initialize models in the worker process."""
+    global worker_upsampler, worker_face_enhancer
+    
+    # print(f"Initializing worker {mp.current_process().name}")
+    worker_upsampler = build_upsampler(
+        model_path=model_path,
+        model_scale=model_scale,
+        tile=tile,
+        tile_pad=tile_pad,
+        pre_pad=pre_pad,
+        use_half=use_half,
+    )
+    
+    if use_face_enhance:
+        worker_face_enhancer = build_face_enhancer(worker_upsampler, model_scale)
+
+
+def process_image_task(
+    src_path: Path,
+    dst_path: Path,
+    outscale: float,
+    max_outscale: float,
+    canvas_size: Tuple[int, int],
+    background: Tuple[int, int, int],
+    jpeg_quality: int,
+) -> Tuple[str, bool, str]:
+    """Worker task to process a single image using global models."""
+    global worker_upsampler, worker_face_enhancer
+    
+    if worker_upsampler is None:
+        return str(src_path), False, "Worker not initialized"
+
+    try:
+        process_image(
+            src_path=src_path,
+            dst_path=dst_path,
+            upsampler=worker_upsampler,
+            face_enhancer=worker_face_enhancer,
+            outscale=outscale,
+            max_outscale=max_outscale,
+            canvas_size=canvas_size,
+            background=background,
+            jpeg_quality=jpeg_quality,
+        )
+        return str(src_path), True, ""
+    except Exception as exc:
+        return str(src_path), False, str(exc)
+
+
 def main() -> int:
     args = parse_args()
     input_dir = args.input_dir
@@ -348,62 +415,122 @@ def main() -> int:
         return 1
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    upsampler = build_upsampler(
-        model_path=args.model_path,
-        model_scale=args.model_scale,
-        tile=args.tile,
-        tile_pad=args.tile_pad,
-        pre_pad=args.pre_pad,
-        use_half=args.use_half,
-    )
-    face_enhancer = None
-    if args.face_enhance:
-        face_enhancer = build_face_enhancer(upsampler, args.model_scale)
-        if face_enhancer is None:
-            print("Continuing without face enhancement.", file=sys.stderr)
-
-    processed = 0
-    failures = 0
-
+    # Collect images
     all_images = list(find_images(input_dir))
     if args.last > 0:
         all_images = all_images[-args.last:]
         print(f"Processing only the last {len(all_images)} images.")
-
-    for idx, src_path in enumerate(all_images, start=1):
+    
+    # Filter out already processed if not overwriting
+    tasks = []
+    for src_path in all_images:
         rel_path = src_path.relative_to(input_dir)
         dst_path = (output_dir / rel_path).with_suffix(".jpg")
+        
         if not args.overwrite and dst_path.exists():
             print(f"[skip] {rel_path} already processed")
             continue
-        if args.limit and processed >= args.limit:
-            break
+        
+        tasks.append((src_path, dst_path))
 
-        try:
-            process_image(
-                src_path=src_path,
-                dst_path=dst_path,
-                upsampler=upsampler,
-                face_enhancer=face_enhancer,
-                outscale=args.outscale,
-                max_outscale=args.max_outscale,
-                canvas_size=canvas_size,
-                background=background,
-                jpeg_quality=jpeg_quality,
-            )
-        except Exception as exc:  # pragma: no cover - runtime safety
-            failures += 1
-            print(f"[fail] {rel_path}: {exc}", file=sys.stderr)
-            traceback.print_exc(file=sys.stderr)
-        else:
-            processed += 1
-            print(f"[ok]   {rel_path} -> {dst_path.relative_to(output_dir)}")
+    if not tasks:
+        print("No images to process.")
+        return 0
 
-        if args.clear_cache_interval and torch.cuda.is_available() and idx % args.clear_cache_interval == 0:
-            torch.cuda.empty_cache()
+    print(f"Processing {len(tasks)} images with {args.workers} workers...")
+
+    # Set start method to spawn for CUDA compatibility
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
+
+    processed_count = 0
+    failures = 0
+
+    # If workers=1, run in main process to avoid overhead/complexity
+    if args.workers <= 1:
+        # Initialize models once
+        upsampler = build_upsampler(
+            model_path=args.model_path,
+            model_scale=args.model_scale,
+            tile=args.tile,
+            tile_pad=args.tile_pad,
+            pre_pad=args.pre_pad,
+            use_half=args.use_half,
+        )
+        face_enhancer = None
+        if args.face_enhance:
+            face_enhancer = build_face_enhancer(upsampler, args.model_scale)
+
+        for i, (src_path, dst_path) in enumerate(tasks, start=1):
+            try:
+                process_image(
+                    src_path=src_path,
+                    dst_path=dst_path,
+                    upsampler=upsampler,
+                    face_enhancer=face_enhancer,
+                    outscale=args.outscale,
+                    max_outscale=args.max_outscale,
+                    canvas_size=canvas_size,
+                    background=background,
+                    jpeg_quality=jpeg_quality,
+                )
+                print(f"[{i}/{len(tasks)}] [ok] {src_path.name}")
+                processed_count += 1
+            except Exception as exc:
+                failures += 1
+                print(f"[{i}/{len(tasks)}] [fail] {src_path.name}: {exc}", file=sys.stderr)
+                traceback.print_exc(file=sys.stderr)
+            
+            if args.clear_cache_interval and torch.cuda.is_available() and i % args.clear_cache_interval == 0:
+                torch.cuda.empty_cache()
+
+    else:
+        # Parallel execution
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=args.workers,
+            initializer=init_worker,
+            initargs=(
+                args.model_path,
+                args.model_scale,
+                args.tile,
+                args.tile_pad,
+                args.pre_pad,
+                args.use_half,
+                args.face_enhance,
+            ),
+        ) as executor:
+            future_to_path = {
+                executor.submit(
+                    process_image_task,
+                    src_path,
+                    dst_path,
+                    args.outscale,
+                    args.max_outscale,
+                    canvas_size,
+                    background,
+                    jpeg_quality,
+                ): src_path
+                for src_path, dst_path in tasks
+            }
+
+            for i, future in enumerate(concurrent.futures.as_completed(future_to_path), start=1):
+                src_path = future_to_path[future]
+                try:
+                    path_str, success, error_msg = future.result()
+                    if success:
+                        print(f"[{i}/{len(tasks)}] [ok] {Path(path_str).name}")
+                        processed_count += 1
+                    else:
+                        failures += 1
+                        print(f"[{i}/{len(tasks)}] [fail] {Path(path_str).name}: {error_msg}", file=sys.stderr)
+                except Exception as exc:
+                    failures += 1
+                    print(f"[{i}/{len(tasks)}] [fail] {src_path.name}: {exc}", file=sys.stderr)
 
     print("\n=== SUMMARY ===")
-    print(f"Successfully processed: {processed} images")
+    print(f"Successfully processed: {processed_count} images")
     if failures:
         print(f"Failed: {failures} images", file=sys.stderr)
     print(f"Output written to: {output_dir.resolve()}")
